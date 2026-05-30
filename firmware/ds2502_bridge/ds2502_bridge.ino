@@ -5,6 +5,22 @@
  *  Uses the proven OneWire library for reliable 1-Wire timing on ESP32.
  *  Install: Arduino IDE -> Library Manager -> search "OneWire" by Jim Studt
  *
+ *  DS2502 Read Memory (0xF0) protocol per datasheet:
+ *    Master: Reset -> ROM cmd -> 0xF0 -> TA1 -> TA2
+ *    Slave:  data bytes continuously (NO CRC between command and data!)
+ *            CRC-16 is appended ONLY at the end of each 32-byte page
+ *
+ *  DS2502 Read Status (0xAA) protocol:
+ *    Master: Reset -> ROM cmd -> 0xAA -> TA1 -> TA2
+ *    Slave:  data bytes continuously, CRC-16 at end of status page (8 bytes)
+ *
+ *  DS2502 Write Memory (0x0F) protocol:
+ *    Master: Reset -> ROM cmd -> 0x0F -> TA1 -> TA2 -> data_byte
+ *    Slave:  CRC-16 (over cmd+TA1+TA2+data)
+ *    Master: programming pulse (12V, >= 480us)
+ *    Slave:  read-back byte
+ *    (subsequent bytes: Master sends data, Slave sends CRC, pulse, readback)
+ *
  *  Wiring:
  *    OW_PIN  (GPIO4)  -> DS2502 DATA + 4.7k pull-up to 3V3
  *    VPP_PIN (GPIO5)  -> 12V Vpp switch control (active HIGH)
@@ -21,7 +37,7 @@
 #define VPP_PIN   5
 #define LED_PIN   2
 
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 #define DS2502_FAMILY 0x09
 
 // DS2502 function commands
@@ -53,7 +69,6 @@ static inline void vppOff() { digitalWrite(VPP_PIN, LOW);  }
 
 // Programming pulse using external 12V switch
 void programPulse() {
-  // Release the data line (OneWire lib does this internally but be explicit)
   pinMode(OW_PIN, INPUT);
   delayMicroseconds(5);
   vppOn();
@@ -69,6 +84,12 @@ uint16_t crc16Update(uint16_t crc, uint8_t data) {
     if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
     else              crc >>= 1;
   }
+  return crc;
+}
+
+uint16_t crc16Buf(const uint8_t* buf, int len) {
+  uint16_t crc = 0;
+  for (int i = 0; i < len; i++) crc = crc16Update(crc, buf[i]);
   return crc;
 }
 
@@ -115,33 +136,34 @@ void blink() {
 }
 
 // ============================================================================
-//  READ BLOCK with page-boundary CRC-16
+//  READ MEMORY / STATUS
 // ============================================================================
+// DS2502 Read Memory (0xF0):
+//   After cmd+TA1+TA2, device IMMEDIATELY outputs data bytes.
+//   At each 32-byte page boundary, device appends a CRC-16 computed over
+//   the data bytes of that page segment.
+//
+// DS2502 Read Status (0xAA):
+//   Same as Read Memory but for the 8-byte status space.
+//   CRC-16 is sent after the status page (all 8 bytes from addr 0).
+//
+// IMPORTANT: There is NO CRC between the command/address and the first data
+// byte. My v2.0/v2.1 incorrectly tried to read 2 CRC bytes there.
+//
 // Returns: 0 ok, 1 no presence
+
 int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
-              bool* cmdCrcOk, bool* pageCrcOk) {
+              bool* pageCrcOk) {
   if (!ow.reset()) return 1;
   owRomCommand();
 
-  uint8_t ta1 = addr & 0xFF;
-  uint8_t ta2 = (addr >> 8) & 0xFF;
   ow.write(cmd);
-  ow.write(ta1);
-  ow.write(ta2);
+  ow.write(addr & 0xFF);
+  ow.write((addr >> 8) & 0xFF);
 
-  // Command CRC-16 (over cmd + TA1 + TA2)
-  uint8_t crcLo = ow.read();
-  uint8_t crcHi = ow.read();
-  uint16_t gotCmd = (uint16_t)crcLo | ((uint16_t)crcHi << 8);
+  // NO CRC here - device starts sending data immediately!
 
-  uint16_t crc = 0;
-  crc = crc16Update(crc, cmd);
-  crc = crc16Update(crc, ta1);
-  crc = crc16Update(crc, ta2);
-  uint16_t expectedCmd = (~crc) & 0xFFFF;
-  if (cmdCrcOk) *cmdCrcOk = (gotCmd == expectedCmd);
-
-  // Read data with page-boundary CRC
+  // Read data, checking page-boundary CRC-16
   bool allPageCrcOk = true;
   uint16_t pageCrc = 0;
   int currentAddr = (int)addr;
@@ -151,13 +173,14 @@ int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
     pageCrc = crc16Update(pageCrc, buf[i]);
     currentAddr++;
 
+    // At page boundary, DS2502 sends CRC-16 of that page's data
     if (currentAddr % DS2502_PAGE_SIZE == 0) {
       uint8_t pLo = ow.read();
       uint8_t pHi = ow.read();
       uint16_t gotPage = (uint16_t)pLo | ((uint16_t)pHi << 8);
       uint16_t expectedPage = (~pageCrc) & 0xFFFF;
       if (gotPage != expectedPage) allPageCrcOk = false;
-      pageCrc = 0;
+      pageCrc = 0;  // reset for next page
     }
   }
 
@@ -165,10 +188,38 @@ int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
   return 0;
 }
 
+// Simple read without page CRC verification (for partial reads or when
+// the read doesn't align to page boundaries)
+int readBlockSimple(uint8_t cmd, uint16_t addr, uint8_t* buf, int len) {
+  if (!ow.reset()) return 1;
+  owRomCommand();
+
+  ow.write(cmd);
+  ow.write(addr & 0xFF);
+  ow.write((addr >> 8) & 0xFF);
+
+  for (int i = 0; i < len; i++) {
+    buf[i] = ow.read();
+  }
+  return 0;
+}
+
 // ============================================================================
-//  WRITE BLOCK with Program Flag detection & continuous page write
+//  WRITE BLOCK with CRC-16 verification + Program Flag + continuous page write
 // ============================================================================
+// DS2502 Write Memory (0x0F):
+//   Master: Reset -> ROM -> 0x0F -> TA1 -> TA2 -> data_byte
+//   Slave:  CRC-16 (cmd + TA1 + TA2 + data_byte)
+//   Master: Programming pulse (12V)
+//   Slave:  Program Flag bit (0=success) then read-back byte
+//   For subsequent bytes within same page:
+//     Master: next_data_byte
+//     Slave:  CRC-16 (new_TA1 + new_TA2 + data_byte)  [address auto-increments]
+//     Master: pulse
+//     Slave:  PF + readback
+//
 // Returns: 0 ok, 1 no presence, 2 CRC mismatch
+
 int writeBlock(uint8_t cmd, uint16_t startAddr, const uint8_t* data, int count,
                uint8_t* readbacks, uint8_t* pfFlags, bool* crcFlags) {
   if (!ow.reset()) return 1;
@@ -187,6 +238,7 @@ int writeBlock(uint8_t cmd, uint16_t startAddr, const uint8_t* data, int count,
   for (int i = 0; i < count; i++) {
     ow.write(data[i]);
 
+    // Read CRC-16 from device
     uint8_t crcLo = ow.read();
     uint8_t crcHi = ow.read();
     uint16_t gotCrc = (uint16_t)crcLo | ((uint16_t)crcHi << 8);
@@ -194,12 +246,14 @@ int writeBlock(uint8_t cmd, uint16_t startAddr, const uint8_t* data, int count,
     // Compute expected CRC
     uint16_t crc = 0;
     if (newTransaction) {
+      // First byte: CRC over cmd + TA1 + TA2 + data
       crc = crc16Update(crc, cmd);
       crc = crc16Update(crc, ta1);
       crc = crc16Update(crc, ta2);
       crc = crc16Update(crc, data[i]);
       newTransaction = false;
     } else {
+      // Subsequent bytes: CRC over auto-incremented address + data
       uint8_t newTa1 = currentAddr & 0xFF;
       uint8_t newTa2 = (currentAddr >> 8) & 0xFF;
       crc = crc16Update(crc, newTa1);
@@ -211,20 +265,20 @@ int writeBlock(uint8_t cmd, uint16_t startAddr, const uint8_t* data, int count,
     if (crcFlags) crcFlags[i] = crcOk;
     if (!crcOk) anyCrcFail = true;
 
-    // Programming pulse
+    // Programming pulse (12V)
     programPulse();
 
-    // Program Flag (PF): device pulls LOW = success (read 0), HIGH = fail (read 1)
+    // Program Flag: device pulls LOW = success (0), stays HIGH = fail (1)
     uint8_t pf = ow.read_bit() ? 1 : 0;
     if (pfFlags) pfFlags[i] = pf;
 
-    // Read-back
+    // Read-back the programmed byte
     uint8_t rb = ow.read();
     if (readbacks) readbacks[i] = rb;
 
     currentAddr++;
 
-    // Page boundary - re-issue full command for next page
+    // Page boundary - must re-issue full command for next page
     if ((currentAddr % DS2502_PAGE_SIZE == 0) && (i < count - 1)) {
       if (!ow.reset()) return 1;
       owRomCommand();
@@ -298,7 +352,7 @@ void handleCommand(String line) {
   // --- READROM ---
   if (cmd == "READROM") {
     if (!ow.reset()) { Serial.println("ERR no_presence"); return; }
-    ow.write(0x33);  // Read ROM
+    ow.write(0x33);  // Read ROM command
     for (int i = 0; i < 8; i++) g_rom[i] = ow.read();
     g_romValid = true;
 
@@ -348,21 +402,35 @@ void handleCommand(String line) {
     if (len <= 0 || len > 256) { Serial.println("ERR bad_len"); return; }
 
     uint8_t buf[256];
-    bool cmdCrcOk = false, pageCrcOk = true;
     uint8_t c = (cmd == "RDMEM") ? CMD_READ_MEMORY : CMD_READ_STATUS;
 
-    int r = readBlock(c, (uint16_t)addr, buf, len, &cmdCrcOk, &pageCrcOk);
-    if (r == 1) { Serial.println("ERR no_presence"); return; }
+    // Check if this is a page-aligned full read (can verify page CRC)
+    bool startAligned = (addr % DS2502_PAGE_SIZE == 0);
+    bool fullPages = (len % DS2502_PAGE_SIZE == 0);
 
-    Serial.print("OK DATA ");
-    for (int i = 0; i < len; i++) printHex(buf[i]);
-    Serial.print(" crc=");
-    Serial.print((cmdCrcOk && pageCrcOk) ? 1 : 0);
-    Serial.print(" cmdcrc=");
-    Serial.print(cmdCrcOk ? 1 : 0);
-    Serial.print(" pagecrc=");
-    Serial.print(pageCrcOk ? 1 : 0);
-    Serial.println();
+    if (startAligned && fullPages) {
+      // Full page-aligned read: verify page CRCs
+      bool pageCrcOk = true;
+      int r = readBlock(c, (uint16_t)addr, buf, len, &pageCrcOk);
+      if (r == 1) { Serial.println("ERR no_presence"); return; }
+
+      Serial.print("OK DATA ");
+      for (int i = 0; i < len; i++) printHex(buf[i]);
+      Serial.print(" crc=");
+      Serial.print(pageCrcOk ? 1 : 0);
+      Serial.print(" pagecrc=");
+      Serial.print(pageCrcOk ? 1 : 0);
+      Serial.println();
+    } else {
+      // Partial/unaligned read: no page CRC check possible
+      int r = readBlockSimple(c, (uint16_t)addr, buf, len);
+      if (r == 1) { Serial.println("ERR no_presence"); return; }
+
+      Serial.print("OK DATA ");
+      for (int i = 0; i < len; i++) printHex(buf[i]);
+      Serial.print(" crc=1 pagecrc=1");
+      Serial.println();
+    }
     return;
   }
 

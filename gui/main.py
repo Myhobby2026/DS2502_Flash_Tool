@@ -393,14 +393,12 @@ class App(tk.Tk):
             if error:
                 self.log(f"Read EEPROM failed: {error}", "err")
                 return
-            data, crc_ok, cmd_crc_ok, page_crc_ok = result
+            data, crc_ok, page_crc_ok = result
             self.last_eeprom = data
             self.eeprom_editor.set_data(data, set_baseline=True)
             crc_detail = ""
-            if not cmd_crc_ok:
-                crc_detail = " [Command CRC FAIL]"
-            elif not page_crc_ok:
-                crc_detail = " [Page CRC FAIL]"
+            if not page_crc_ok:
+                crc_detail = " [Page CRC FAIL - possible data corruption]"
             self.log(f"Read {len(data)} bytes. CRC {'OK' if crc_ok else 'FAIL'}{crc_detail}.",
                      "ok" if crc_ok else "warn")
 
@@ -426,7 +424,7 @@ class App(tk.Tk):
             results = []
             for start, length in runs:
                 results.append(self.dev.write_memory(start, desired[start:start+length]))
-            verify, _, _, _ = self.dev.read_memory(0, DATA_SIZE)
+            verify, _, _ = self.dev.read_memory(0, DATA_SIZE)
             return results, verify
 
         def done(result, error):
@@ -452,7 +450,7 @@ class App(tk.Tk):
             if error:
                 self.log(f"Verify failed: {error}", "err")
                 return
-            data, _, _, _ = result
+            data, _, _ = result
             diffs = [i for i in range(DATA_SIZE) if data[i] != desired[i]]
             if not diffs:
                 self.log("Verify PASSED.", "ok")
@@ -472,15 +470,10 @@ class App(tk.Tk):
             if error:
                 self.log(f"Read status failed: {error}", "err")
                 return
-            data, crc_ok, cmd_crc_ok, page_crc_ok = result
+            data, crc_ok, page_crc_ok = result
             self.last_status = data
             self.status_editor.set_data(data, set_baseline=True)
-            crc_detail = ""
-            if not cmd_crc_ok:
-                crc_detail = " [Command CRC FAIL]"
-            elif not page_crc_ok:
-                crc_detail = " [Page CRC FAIL]"
-            self.log(f"Status: {data.hex().upper()} CRC {'OK' if crc_ok else 'FAIL'}{crc_detail}",
+            self.log(f"Status: {data.hex().upper()} CRC {'OK' if crc_ok else 'FAIL'}",
                      "ok" if crc_ok else "warn")
 
         self._run_async(work, done, "Reading status...")
@@ -502,7 +495,7 @@ class App(tk.Tk):
             results = []
             for start, length in runs:
                 results.append(self.dev.write_status(start, desired[start:start+length]))
-            verify, _, _, _ = self.dev.read_status(0, STATUS_SIZE)
+            verify, _, _ = self.dev.read_status(0, STATUS_SIZE)
             return results, verify
 
         def done(result, error):

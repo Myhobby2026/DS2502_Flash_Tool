@@ -166,19 +166,16 @@ class DS2502:
         except (ValueError, IndexError):
             raise DS2502Error(f"Malformed read response: {resp!r}")
         data = self._hex_to_bytes(payload)
-        # Combined CRC flag (cmd CRC + page CRC both OK)
         crc_ok = (kv.get("crc") == "1")
-        # Detailed: cmdcrc and pagecrc available in fw 2.0+
-        cmd_crc_ok = (kv.get("cmdcrc", "1") == "1")
         page_crc_ok = (kv.get("pagecrc", "1") == "1")
-        return data, crc_ok, cmd_crc_ok, page_crc_ok
+        return data, crc_ok, page_crc_ok
 
     def read_memory(self, addr: int = 0, length: int = DATA_SIZE):
-        """Read data EEPROM. Returns (data, crc_ok, cmd_crc_ok, page_crc_ok)."""
+        """Read data EEPROM. Returns (data, crc_ok, page_crc_ok)."""
         return self._read_block("RDMEM", addr, length)
 
     def read_status(self, addr: int = 0, length: int = STATUS_SIZE):
-        """Read status memory. Returns (data, crc_ok, cmd_crc_ok, page_crc_ok)."""
+        """Read status memory. Returns (data, crc_ok, page_crc_ok)."""
         return self._read_block("RDSTAT", addr, length)
 
     def _write_block(self, cmd: str, addr: int, data: bytes) -> WriteResult:
