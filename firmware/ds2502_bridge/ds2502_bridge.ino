@@ -64,7 +64,7 @@
 #define VPP_PIN   5      // 12V Vpp switch control (active HIGH)
 #define LED_PIN   2      // activity LED
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "2.0.0"
 #define DS2502_FAMILY 0x09
 
 // DS2502 memory function command bytes
@@ -306,13 +306,31 @@ bool searchNext() {
 }
 
 // ----------------------------------------------------------------------------
-//  Memory / Status read
+//  Memory / Status read - with page-boundary CRC-16 verification
 // ----------------------------------------------------------------------------
-// cmd = CMD_READ_MEMORY or CMD_READ_STATUS.
-// Reads 'len' bytes from 'addr' into buf. crcOk reports the validity of the
-// CRC-16 the DS2502 transmits for {cmd, TA1, TA2}.
-// Returns 0 ok, 1 no presence.
-int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len, bool* crcOk) {
+// DS2502 datasheet: After the command CRC-16 (cmd+TA1+TA2), the device sends
+// data bytes. At each 32-byte page boundary, the device transmits a CRC-16
+// computed over all data bytes from the start of the current page (or from the
+// starting address within that page for the first partial page).
+//
+// This implementation:
+//  1) Verifies the command CRC-16 (cmd + TA1 + TA2)
+//  2) Reads data bytes and verifies the page-end CRC-16 at each boundary
+//
+// Parameters:
+//   cmd     - CMD_READ_MEMORY or CMD_READ_STATUS
+//   addr    - starting address
+//   buf     - output buffer (caller must allocate >= len bytes)
+//   len     - number of data bytes to read
+//   cmdCrcOk  - set to true if the command CRC matches
+//   pageCrcOk - set to true if ALL page-boundary CRCs match
+//
+// Returns: 0 ok, 1 no presence.
+
+#define DS2502_PAGE_SIZE  32   // bytes per page for CRC boundary
+
+int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
+              bool* cmdCrcOk, bool* pageCrcOk) {
   if (!owReset()) return 1;
   owRomCommand();
 
@@ -322,59 +340,186 @@ int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len, bool* crcOk) {
   owWriteByte(ta1);
   owWriteByte(ta2);
 
+  // --- Command CRC-16 verification (over cmd + TA1 + TA2) ---
   uint8_t crcLo = owReadByte();
   uint8_t crcHi = owReadByte();
-  uint16_t got  = (uint16_t)crcLo | ((uint16_t)crcHi << 8);
+  uint16_t gotCmd = (uint16_t)crcLo | ((uint16_t)crcHi << 8);
 
   uint16_t crc = 0;
   crc = crc16Update(crc, cmd);
   crc = crc16Update(crc, ta1);
   crc = crc16Update(crc, ta2);
-  uint16_t expected = (~crc) & 0xFFFF;
-  if (crcOk) *crcOk = (got == expected);
+  uint16_t expectedCmd = (~crc) & 0xFFFF;
+  if (cmdCrcOk) *cmdCrcOk = (gotCmd == expectedCmd);
 
-  for (int i = 0; i < len; i++) buf[i] = owReadByte();
+  // --- Read data with page-boundary CRC-16 verification ---
+  // The DS2502 outputs a CRC-16 after the last byte of each 32-byte page.
+  // The CRC covers all data bytes read within that page segment.
+  bool allPageCrcOk = true;
+  uint16_t pageCrc = 0;
+  int bytesInPage = 0;
+  int currentAddr = (int)addr;
+
+  // How many bytes until the first page boundary?
+  int firstBoundary = DS2502_PAGE_SIZE - (currentAddr % DS2502_PAGE_SIZE);
+
+  for (int i = 0; i < len; i++) {
+    buf[i] = owReadByte();
+    pageCrc = crc16Update(pageCrc, buf[i]);
+    bytesInPage++;
+    currentAddr++;
+
+    // Check if we hit a page boundary
+    bool atBoundary = (currentAddr % DS2502_PAGE_SIZE == 0);
+    bool isLastByte = (i == len - 1);
+
+    if (atBoundary) {
+      // DS2502 sends CRC-16 at page boundary
+      uint8_t pLo = owReadByte();
+      uint8_t pHi = owReadByte();
+      uint16_t gotPage = (uint16_t)pLo | ((uint16_t)pHi << 8);
+      uint16_t expectedPage = (~pageCrc) & 0xFFFF;
+      if (gotPage != expectedPage) allPageCrcOk = false;
+
+      // Reset for next page
+      pageCrc = 0;
+      bytesInPage = 0;
+    }
+  }
+
+  if (pageCrcOk) *pageCrcOk = allPageCrcOk;
   return 0;
 }
 
+// Overloaded version for backward compatibility (single crcOk flag)
+int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len, bool* crcOk) {
+  bool cmdOk = false, pageOk = true;
+  int ret = readBlock(cmd, addr, buf, len, &cmdOk, &pageOk);
+  if (crcOk) *crcOk = (cmdOk && pageOk);
+  return ret;
+}
+
 // ----------------------------------------------------------------------------
-//  Memory / Status write (program one byte per transaction with verify)
+//  Memory / Status write - with Program Flag detection & continuous page write
 // ----------------------------------------------------------------------------
-// cmd = CMD_WRITE_MEMORY or CMD_WRITE_STATUS.
-// Returns 0 ok, 1 no presence, 2 crc mismatch (still attempted), and always
-// reports the actual read-back value and CRC the device generated.
-int writeByte(uint8_t cmd, uint16_t addr, uint8_t value,
-              uint8_t* readbackOut, uint16_t* crcOut, bool* crcOk) {
+// DS2502 Datasheet programming sequence (per byte):
+//   Master: cmd + TA1 + TA2 + data_byte
+//   Slave:  CRC-16 (of cmd+TA1+TA2+data)
+//   Master: programming pulse (12V, >= 480us)
+//   Slave:  Program Flag (PF) - device pulls line LOW briefly after pulse
+//            PF=0 (low) means programming succeeded
+//            PF=1 (high) means programming failed (pulse too short / no Vpp)
+//   Slave:  read-back byte (actual value in memory after programming)
+//
+// For CONTINUOUS write within same page:
+//   After reading back the first byte, subsequent bytes can be written
+//   WITHOUT re-issuing reset + ROM command + write command + full address.
+//   The DS2502 auto-increments the address within the current page.
+//   Master just sends: next_data_byte
+//   Slave responds: CRC-16 (of new address + data)
+//   Then: pulse -> PF -> readback -> repeat until page boundary.
+//
+// Parameters:
+//   cmd        - CMD_WRITE_MEMORY or CMD_WRITE_STATUS
+//   addr       - starting byte address
+//   data       - pointer to bytes to program
+//   count      - number of bytes to program
+//   readbacks  - output: actual read-back values (caller allocates >= count)
+//   pfFlags    - output: program flag per byte (0=success, 1=fail)
+//   crcFlags   - output: CRC ok per byte (true/false)
+//
+// Returns: 0 ok, 1 no presence, 2 at least one CRC mismatch.
+
+int writeBlock(uint8_t cmd, uint16_t startAddr, const uint8_t* data, int count,
+               uint8_t* readbacks, uint8_t* pfFlags, bool* crcFlags) {
   if (!owReset()) return 1;
   owRomCommand();
 
-  uint8_t ta1 = addr & 0xFF;
-  uint8_t ta2 = (addr >> 8) & 0xFF;
+  uint8_t ta1 = startAddr & 0xFF;
+  uint8_t ta2 = (startAddr >> 8) & 0xFF;
   owWriteByte(cmd);
   owWriteByte(ta1);
   owWriteByte(ta2);
-  owWriteByte(value);
 
-  uint8_t crcLo = owReadByte();
-  uint8_t crcHi = owReadByte();
-  uint16_t got  = (uint16_t)crcLo | ((uint16_t)crcHi << 8);
-  if (crcOut) *crcOut = got;
+  bool anyCrcFail = false;
+  uint16_t currentAddr = startAddr;
+  bool newTransaction = true;  // true when we just issued cmd+TA1+TA2
 
-  uint16_t crc = 0;
-  crc = crc16Update(crc, cmd);
-  crc = crc16Update(crc, ta1);
-  crc = crc16Update(crc, ta2);
-  crc = crc16Update(crc, value);
-  uint16_t expected = (~crc) & 0xFFFF;
-  bool ok = (got == expected);
-  if (crcOk) *crcOk = ok;
+  for (int i = 0; i < count; i++) {
+    // Send data byte
+    owWriteByte(data[i]);
 
-  // Apply the 12V programming pulse, then read back the programmed byte.
-  programPulse();
-  uint8_t rb = owReadByte();
+    // Read CRC-16 from device
+    uint8_t crcLo = owReadByte();
+    uint8_t crcHi = owReadByte();
+    uint16_t gotCrc = (uint16_t)crcLo | ((uint16_t)crcHi << 8);
+
+    // Compute expected CRC-16
+    uint16_t crc = 0;
+    if (newTransaction) {
+      // First byte after cmd+TA: CRC covers cmd + TA1 + TA2 + data
+      crc = crc16Update(crc, cmd);
+      crc = crc16Update(crc, ta1);
+      crc = crc16Update(crc, ta2);
+      crc = crc16Update(crc, data[i]);
+      newTransaction = false;
+    } else {
+      // Subsequent bytes in continuous mode:
+      // CRC covers the auto-incremented address (TA1+TA2) + data
+      uint8_t newTa1 = currentAddr & 0xFF;
+      uint8_t newTa2 = (currentAddr >> 8) & 0xFF;
+      crc = crc16Update(crc, newTa1);
+      crc = crc16Update(crc, newTa2);
+      crc = crc16Update(crc, data[i]);
+    }
+    uint16_t expectedCrc = (~crc) & 0xFFFF;
+    bool crcOk = (gotCrc == expectedCrc);
+    if (crcFlags) crcFlags[i] = crcOk;
+    if (!crcOk) anyCrcFail = true;
+
+    // Apply 12V programming pulse
+    programPulse();
+
+    // Read Program Flag (PF) - DS2502 pulls line LOW if programming succeeded
+    // PF bit: 0 = success (device pulled low), 1 = fail (line stayed high)
+    uint8_t pf = owReadBit() ? 1 : 0;
+    if (pfFlags) pfFlags[i] = pf;
+
+    // Read back the programmed byte
+    uint8_t rb = owReadByte();
+    if (readbacks) readbacks[i] = rb;
+
+    // Advance address (DS2502 auto-increments within the page)
+    currentAddr++;
+
+    // Check if we crossed a page boundary - must re-issue full command
+    if ((currentAddr % DS2502_PAGE_SIZE == 0) && (i < count - 1)) {
+      if (!owReset()) return 1;
+      owRomCommand();
+      ta1 = currentAddr & 0xFF;
+      ta2 = (currentAddr >> 8) & 0xFF;
+      owWriteByte(cmd);
+      owWriteByte(ta1);
+      owWriteByte(ta2);
+      newTransaction = true;  // next byte uses cmd+TA+data CRC format
+    }
+  }
+
+  return anyCrcFail ? 2 : 0;
+}
+
+// Legacy single-byte write (backward compat for the serial handler)
+int writeByte(uint8_t cmd, uint16_t addr, uint8_t value,
+              uint8_t* readbackOut, uint16_t* crcOut, bool* crcOk) {
+  uint8_t rb = 0xFF;
+  uint8_t pf = 1;
+  bool cFlag = false;
+
+  int ret = writeBlock(cmd, addr, &value, 1, &rb, &pf, &cFlag);
   if (readbackOut) *readbackOut = rb;
-
-  return ok ? 0 : 2;
+  if (crcOk) *crcOk = cFlag;
+  if (crcOut) *crcOut = 0;  // deprecated field
+  return ret;
 }
 
 // ----------------------------------------------------------------------------
@@ -503,14 +648,20 @@ void handleCommand(String line) {
     int len   = args.substring(sp2 + 1).toInt();
     if (len <= 0 || len > 256) { Serial.println("ERR bad_len"); return; }
     uint8_t buf[256];
-    bool crcOk = false;
+    bool cmdCrcOk = false;
+    bool pageCrcOk = true;
     uint8_t c = (cmd == "RDMEM") ? CMD_READ_MEMORY : CMD_READ_STATUS;
-    int r = readBlock(c, (uint16_t)addr, buf, len, &crcOk);
+    int r = readBlock(c, (uint16_t)addr, buf, len, &cmdCrcOk, &pageCrcOk);
     if (r == 1) { Serial.println("ERR no_presence"); return; }
     Serial.print("OK DATA ");
     for (int i = 0; i < len; i++) printHex(buf[i]);
     Serial.print(" crc=");
-    Serial.println(crcOk ? 1 : 0);
+    Serial.print((cmdCrcOk && pageCrcOk) ? 1 : 0);
+    Serial.print(" cmdcrc=");
+    Serial.print(cmdCrcOk ? 1 : 0);
+    Serial.print(" pagecrc=");
+    Serial.print(pageCrcOk ? 1 : 0);
+    Serial.println();
     return;
   }
 
@@ -526,27 +677,30 @@ void handleCommand(String line) {
     uint8_t c = (cmd == "WRMEM") ? CMD_WRITE_MEMORY : CMD_WRITE_STATUS;
 
     uint8_t  readbacks[256];
-    uint16_t crcs[256];
-    bool     allCrcOk = true;
-    int      written  = 0;
+    uint8_t  pfFlags[256];
+    bool     crcFlags[256];
+
+    int r = writeBlock(c, (uint16_t)addr, data, n, readbacks, pfFlags, crcFlags);
+    if (r == 1) { Serial.println("ERR no_presence"); return; }
+
+    // Compute summary flags
+    bool allCrcOk = true;
+    bool allPfOk  = true;
     for (int i = 0; i < n; i++) {
-      uint8_t  rb  = 0xFF;
-      uint16_t crc = 0;
-      bool     ok  = false;
-      int r = writeByte(c, (uint16_t)(addr + i), data[i], &rb, &crc, &ok);
-      if (r == 1) { Serial.println("ERR no_presence"); return; }
-      readbacks[i] = rb;
-      crcs[i] = crc;
-      if (!ok) allCrcOk = false;
-      written++;
+      if (!crcFlags[i]) allCrcOk = false;
+      if (pfFlags[i] != 0) allPfOk = false;
     }
 
     Serial.print("OK WROTE n=");
-    Serial.print(written);
+    Serial.print(n);
     Serial.print(" crcok=");
     Serial.print(allCrcOk ? 1 : 0);
+    Serial.print(" pfok=");
+    Serial.print(allPfOk ? 1 : 0);
     Serial.print(" rb=");
-    for (int i = 0; i < written; i++) printHex(readbacks[i]);
+    for (int i = 0; i < n; i++) printHex(readbacks[i]);
+    Serial.print(" pf=");
+    for (int i = 0; i < n; i++) Serial.print(pfFlags[i]);
     Serial.println();
     return;
   }

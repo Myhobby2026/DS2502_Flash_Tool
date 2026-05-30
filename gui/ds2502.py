@@ -61,14 +61,20 @@ class WriteResult:
     requested: bytes
     readback: bytes
     crc_ok: bool
+    pf_ok: bool = True      # Program Flag: True = all bytes programmed successfully
+    pf_flags: str = ""      # Per-byte PF string (e.g. "0000" = all good)
 
     @property
     def verified(self) -> bool:
-        return self.readback == self.requested and self.crc_ok
+        return self.readback == self.requested and self.crc_ok and self.pf_ok
 
     def mismatches(self) -> List[int]:
         return [i for i in range(len(self.requested))
                 if i < len(self.readback) and self.readback[i] != self.requested[i]]
+
+    def pf_failures(self) -> List[int]:
+        """Indices where Program Flag indicated failure (pulse not accepted)."""
+        return [i for i, ch in enumerate(self.pf_flags) if ch != '0']
 
 
 def crc8(data: bytes) -> int:
@@ -159,12 +165,20 @@ class DS2502:
             payload = tokens[di + 1]
         except (ValueError, IndexError):
             raise DS2502Error(f"Malformed read response: {resp!r}")
-        return self._hex_to_bytes(payload), (kv.get("crc") == "1")
+        data = self._hex_to_bytes(payload)
+        # Combined CRC flag (cmd CRC + page CRC both OK)
+        crc_ok = (kv.get("crc") == "1")
+        # Detailed: cmdcrc and pagecrc available in fw 2.0+
+        cmd_crc_ok = (kv.get("cmdcrc", "1") == "1")
+        page_crc_ok = (kv.get("pagecrc", "1") == "1")
+        return data, crc_ok, cmd_crc_ok, page_crc_ok
 
     def read_memory(self, addr: int = 0, length: int = DATA_SIZE):
+        """Read data EEPROM. Returns (data, crc_ok, cmd_crc_ok, page_crc_ok)."""
         return self._read_block("RDMEM", addr, length)
 
     def read_status(self, addr: int = 0, length: int = STATUS_SIZE):
+        """Read status memory. Returns (data, crc_ok, cmd_crc_ok, page_crc_ok)."""
         return self._read_block("RDSTAT", addr, length)
 
     def _write_block(self, cmd: str, addr: int, data: bytes) -> WriteResult:
@@ -174,8 +188,14 @@ class DS2502:
         resp = self._expect_ok(self.bridge.command(f"{cmd} {addr:X} {hexstr}", timeout=15.0))
         kv = self._parse_kv(resp)
         readback = self._hex_to_bytes(kv.get("rb", ""))
-        return WriteResult(address=addr, requested=data, readback=readback,
-                           crc_ok=(kv.get("crcok") == "1"))
+        pf_ok = (kv.get("pfok", "1") == "1")
+        pf_flags = kv.get("pf", "")
+        return WriteResult(
+            address=addr, requested=data, readback=readback,
+            crc_ok=(kv.get("crcok") == "1"),
+            pf_ok=pf_ok,
+            pf_flags=pf_flags,
+        )
 
     def write_memory(self, addr: int, data: bytes) -> WriteResult:
         return self._write_block("WRMEM", addr, data)
