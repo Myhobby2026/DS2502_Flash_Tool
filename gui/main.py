@@ -151,6 +151,8 @@ class App(tk.Tk):
         add("Load .bin", self._load_file)
         add("Save .bin", self._save_file)
         add("Fill 0xFF", self._fill_blank)
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=6)
+        add("Raw Dump", self._raw_dump)
 
     def _build_notebook(self) -> None:
         nb = ttk.Notebook(self)
@@ -563,6 +565,41 @@ class App(tk.Tk):
     def _fill_blank(self) -> None:
         self.eeprom_editor.set_data(bytes([0xFF] * DATA_SIZE), set_baseline=False)
         self.log("Filled with 0xFF.", "info")
+
+    def _raw_dump(self) -> None:
+        """Diagnostic: dump the raw on-wire byte stream for Read Memory and
+        Read Status so the true framing can be compared with a reference
+        programmer (e.g. ELNEC). Does NOT interpret CRCs."""
+        if not self._require_connection():
+            return
+
+        def work():
+            # 140 bytes covers: cmd CRC(2) + 4*(32 data + 2 page CRC) = 138
+            mem = self.bridge.command("RAWRD F0 0 140", timeout=8.0)
+            sta = self.bridge.command("RAWRD AA 0 16", timeout=6.0)
+            return mem, sta
+
+        def done(result, error):
+            if error:
+                self.log(f"Raw dump failed: {error}", "err")
+                return
+            mem, sta = result
+            self.log("=== RAW DUMP (compare with ELNEC) ===", "tx")
+            self.log(f"Read Memory (F0 @0, 140 bytes):", "info")
+            self.log(f"  {self._extract_raw(mem)}", "info")
+            self.log(f"Read Status (AA @0, 16 bytes):", "info")
+            self.log(f"  {self._extract_raw(sta)}", "info")
+            self.log("Paste these two lines back to compare framing.", "tx")
+
+        self._run_async(work, done, "Raw dump...")
+
+    @staticmethod
+    def _extract_raw(resp: str) -> str:
+        """Pull the bytes=... payload out of a RAWRD response, else echo it."""
+        for tok in (resp or "").split():
+            if tok.startswith("bytes="):
+                return tok[len("bytes="):]
+        return resp or "(no response)"
 
     def _on_eeprom_change(self) -> None:
         n = len(self.eeprom_editor.changed_indices())

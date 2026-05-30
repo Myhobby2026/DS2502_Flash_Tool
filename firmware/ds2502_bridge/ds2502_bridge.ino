@@ -37,7 +37,7 @@
 #define VPP_PIN   5
 #define LED_PIN   2
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 #define DS2502_FAMILY 0x09
 
 // DS2502 function commands
@@ -138,32 +138,40 @@ void blink() {
 // ============================================================================
 //  READ MEMORY / STATUS
 // ============================================================================
-// DS2502 Read Memory (0xF0):
-//   After cmd+TA1+TA2, device IMMEDIATELY outputs data bytes.
-//   At each 32-byte page boundary, device appends a CRC-16 computed over
-//   the data bytes of that page segment.
+// DS2502 Read Memory (0xF0) / Read Status (0xAA), per datasheet:
+//   Master: Reset -> ROM -> cmd -> TA1 -> TA2
+//   Device: CRC-16 (inverted) of {cmd, TA1, TA2}        <-- 2 bytes
+//   Device: data bytes from target address to end of page
+//   Device: CRC-16 (inverted) of that page's data bytes  <-- at each 32-byte
+//           page boundary; the CRC generator resets each page
 //
-// DS2502 Read Status (0xAA):
-//   Same as Read Memory but for the 8-byte status space.
-//   CRC-16 is sent after the status page (all 8 bytes from addr 0).
-//
-// IMPORTANT: There is NO CRC between the command/address and the first data
-// byte. My v2.0/v2.1 incorrectly tried to read 2 CRC bytes there.
+// CRC checks are INFORMATIONAL ONLY here - we always consume the CRC bytes so
+// the data stays aligned, but a CRC mismatch never blocks/replaces the data.
 //
 // Returns: 0 ok, 1 no presence
 
 int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
-              bool* pageCrcOk) {
+              bool* cmdCrcOk, bool* pageCrcOk) {
   if (!ow.reset()) return 1;
   owRomCommand();
 
+  uint8_t ta1 = addr & 0xFF;
+  uint8_t ta2 = (addr >> 8) & 0xFF;
   ow.write(cmd);
-  ow.write(addr & 0xFF);
-  ow.write((addr >> 8) & 0xFF);
+  ow.write(ta1);
+  ow.write(ta2);
 
-  // NO CRC here - device starts sending data immediately!
+  // --- Command CRC-16 (over cmd + TA1 + TA2), LSB first, inverted ---
+  uint8_t cl = ow.read();
+  uint8_t ch = ow.read();
+  uint16_t gotCmd = (uint16_t)cl | ((uint16_t)ch << 8);
+  uint16_t crc = 0;
+  crc = crc16Update(crc, cmd);
+  crc = crc16Update(crc, ta1);
+  crc = crc16Update(crc, ta2);
+  if (cmdCrcOk) *cmdCrcOk = (gotCmd == (uint16_t)(~crc));
 
-  // Read data, checking page-boundary CRC-16
+  // --- Data with page-boundary CRC-16 ---
   bool allPageCrcOk = true;
   uint16_t pageCrc = 0;
   int currentAddr = (int)addr;
@@ -173,13 +181,11 @@ int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
     pageCrc = crc16Update(pageCrc, buf[i]);
     currentAddr++;
 
-    // At page boundary, DS2502 sends CRC-16 of that page's data
     if (currentAddr % DS2502_PAGE_SIZE == 0) {
-      uint8_t pLo = ow.read();
-      uint8_t pHi = ow.read();
-      uint16_t gotPage = (uint16_t)pLo | ((uint16_t)pHi << 8);
-      uint16_t expectedPage = (~pageCrc) & 0xFFFF;
-      if (gotPage != expectedPage) allPageCrcOk = false;
+      uint8_t pl = ow.read();
+      uint8_t ph = ow.read();
+      uint16_t gotPage = (uint16_t)pl | ((uint16_t)ph << 8);
+      if (gotPage != (uint16_t)(~pageCrc)) allPageCrcOk = false;
       pageCrc = 0;  // reset for next page
     }
   }
@@ -188,19 +194,16 @@ int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
   return 0;
 }
 
-// Simple read without page CRC verification (for partial reads or when
-// the read doesn't align to page boundaries)
-int readBlockSimple(uint8_t cmd, uint16_t addr, uint8_t* buf, int len) {
+// DIAGNOSTIC: dump 'count' raw bytes exactly as the device sends them right
+// after Reset -> ROM -> cmd -> TA1 -> TA2, with NO interpretation. Use this to
+// compare the true on-wire framing against a reference programmer (e.g. ELNEC).
+int rawRead(uint8_t cmd, uint16_t addr, uint8_t* buf, int count) {
   if (!ow.reset()) return 1;
   owRomCommand();
-
   ow.write(cmd);
   ow.write(addr & 0xFF);
   ow.write((addr >> 8) & 0xFF);
-
-  for (int i = 0; i < len; i++) {
-    buf[i] = ow.read();
-  }
+  for (int i = 0; i < count; i++) buf[i] = ow.read();
   return 0;
 }
 
@@ -404,33 +407,52 @@ void handleCommand(String line) {
     uint8_t buf[256];
     uint8_t c = (cmd == "RDMEM") ? CMD_READ_MEMORY : CMD_READ_STATUS;
 
-    // Check if this is a page-aligned full read (can verify page CRC)
-    bool startAligned = (addr % DS2502_PAGE_SIZE == 0);
-    bool fullPages = (len % DS2502_PAGE_SIZE == 0);
+    bool cmdCrcOk = false, pageCrcOk = true;
+    int r = readBlock(c, (uint16_t)addr, buf, len, &cmdCrcOk, &pageCrcOk);
+    if (r == 1) { Serial.println("ERR no_presence"); return; }
 
-    if (startAligned && fullPages) {
-      // Full page-aligned read: verify page CRCs
-      bool pageCrcOk = true;
-      int r = readBlock(c, (uint16_t)addr, buf, len, &pageCrcOk);
-      if (r == 1) { Serial.println("ERR no_presence"); return; }
+    Serial.print("OK DATA ");
+    for (int i = 0; i < len; i++) printHex(buf[i]);
+    Serial.print(" crc=");
+    Serial.print((cmdCrcOk && pageCrcOk) ? 1 : 0);
+    Serial.print(" cmdcrc=");
+    Serial.print(cmdCrcOk ? 1 : 0);
+    Serial.print(" pagecrc=");
+    Serial.print(pageCrcOk ? 1 : 0);
+    Serial.println();
+    return;
+  }
 
-      Serial.print("OK DATA ");
-      for (int i = 0; i < len; i++) printHex(buf[i]);
-      Serial.print(" crc=");
-      Serial.print(pageCrcOk ? 1 : 0);
-      Serial.print(" pagecrc=");
-      Serial.print(pageCrcOk ? 1 : 0);
-      Serial.println();
-    } else {
-      // Partial/unaligned read: no page CRC check possible
-      int r = readBlockSimple(c, (uint16_t)addr, buf, len);
-      if (r == 1) { Serial.println("ERR no_presence"); return; }
+  // --- RAWRD : diagnostic raw byte dump ---
+  // Usage: RAWRD <cmdHex> <addrHex> <count>
+  //   e.g. RAWRD F0 0 140   (Read Memory @0, dump 140 raw bytes)
+  //        RAWRD AA 0 16    (Read Status @0, dump 16 raw bytes)
+  // Prints exactly what the chip sends with NO framing interpretation, so the
+  // true on-wire byte order (command CRC, page CRCs, data) can be compared
+  // against a reference programmer.
+  if (cmd == "RAWRD") {
+    int s1 = args.indexOf(' ');
+    if (s1 < 0) { Serial.println("ERR bad_args"); return; }
+    int s2 = args.indexOf(' ', s1 + 1);
+    if (s2 < 0) { Serial.println("ERR bad_args"); return; }
+    uint8_t rcmd = (uint8_t)strtol(args.substring(0, s1).c_str(), NULL, 16);
+    long raddr = strtol(args.substring(s1 + 1, s2).c_str(), NULL, 16);
+    int rcount = args.substring(s2 + 1).toInt();
+    if (rcount <= 0 || rcount > 256) { Serial.println("ERR bad_len"); return; }
 
-      Serial.print("OK DATA ");
-      for (int i = 0; i < len; i++) printHex(buf[i]);
-      Serial.print(" crc=1 pagecrc=1");
-      Serial.println();
-    }
+    uint8_t buf[256];
+    int r = rawRead(rcmd, (uint16_t)raddr, buf, rcount);
+    if (r == 1) { Serial.println("ERR no_presence"); return; }
+
+    Serial.print("OK RAW cmd=");
+    printHex(rcmd);
+    Serial.print(" addr=");
+    Serial.print(raddr, HEX);
+    Serial.print(" n=");
+    Serial.print(rcount);
+    Serial.print(" bytes=");
+    for (int i = 0; i < rcount; i++) printHex(buf[i]);
+    Serial.println();
     return;
   }
 
