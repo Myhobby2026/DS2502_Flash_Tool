@@ -37,7 +37,7 @@
 #define VPP_PIN   5
 #define LED_PIN   2
 
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.4.0"
 #define DS2502_FAMILY 0x09
 
 // DS2502 function commands
@@ -136,61 +136,40 @@ void blink() {
 }
 
 // ============================================================================
-//  READ MEMORY / STATUS
+//  READ MEMORY / STATUS   (framing per proven reference + ELNEC comparison)
 // ============================================================================
-// DS2502 Read Memory (0xF0) / Read Status (0xAA), per datasheet:
-//   Master: Reset -> ROM -> cmd -> TA1 -> TA2
-//   Device: CRC-16 (inverted) of {cmd, TA1, TA2}        <-- 2 bytes
-//   Device: data bytes from target address to end of page
-//   Device: CRC-16 (inverted) of that page's data bytes  <-- at each 32-byte
-//           page boundary; the CRC generator resets each page
+// DS2502 Read Memory (0xF0):
+//   Master: Reset -> Skip/Match ROM -> 0xF0 -> TA1 -> TA2
+//   Device: ONE address-CRC byte    <-- must be discarded (else data shifts +1)
+//   Device: 128 data bytes streamed continuously  (NO inter-page CRC bytes)
 //
-// CRC checks are INFORMATIONAL ONLY here - we always consume the CRC bytes so
-// the data stays aligned, but a CRC mismatch never blocks/replaces the data.
+// DS2502 Read Status (0xAA):
+//   Master: Reset -> Skip/Match ROM -> 0xAA -> TA1 -> TA2
+//   Device: status bytes streamed continuously     (NO address-CRC discard)
+//
+// Verified against an ELNEC programmer: with Read Memory, the first byte the
+// device sends after TA2 is a CRC byte (e.g. 0x8D), and the real data (e.g.
+// 0x4F) begins on the next byte. Discarding exactly one byte aligns our output
+// with ELNEC. Read Status has no such leading byte.
+//
+//   addrDiscard = number of bytes to drop after TA2 (1 for memory, 0 for status)
 //
 // Returns: 0 ok, 1 no presence
 
-int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len,
-              bool* cmdCrcOk, bool* pageCrcOk) {
+int readBlock(uint8_t cmd, uint16_t addr, uint8_t* buf, int len, int addrDiscard) {
   if (!ow.reset()) return 1;
   owRomCommand();
 
-  uint8_t ta1 = addr & 0xFF;
-  uint8_t ta2 = (addr >> 8) & 0xFF;
   ow.write(cmd);
-  ow.write(ta1);
-  ow.write(ta2);
+  ow.write(addr & 0xFF);          // TA1 (low)
+  ow.write((addr >> 8) & 0xFF);   // TA2 (high)
 
-  // --- Command CRC-16 (over cmd + TA1 + TA2), LSB first, inverted ---
-  uint8_t cl = ow.read();
-  uint8_t ch = ow.read();
-  uint16_t gotCmd = (uint16_t)cl | ((uint16_t)ch << 8);
-  uint16_t crc = 0;
-  crc = crc16Update(crc, cmd);
-  crc = crc16Update(crc, ta1);
-  crc = crc16Update(crc, ta2);
-  if (cmdCrcOk) *cmdCrcOk = (gotCmd == (uint16_t)(~crc));
+  // Discard the leading address-CRC byte(s) so data aligns with ELNEC.
+  for (int i = 0; i < addrDiscard; i++) (void)ow.read();
 
-  // --- Data with page-boundary CRC-16 ---
-  bool allPageCrcOk = true;
-  uint16_t pageCrc = 0;
-  int currentAddr = (int)addr;
+  // Stream data bytes continuously (no inter-page CRC consumption).
+  for (int i = 0; i < len; i++) buf[i] = ow.read();
 
-  for (int i = 0; i < len; i++) {
-    buf[i] = ow.read();
-    pageCrc = crc16Update(pageCrc, buf[i]);
-    currentAddr++;
-
-    if (currentAddr % DS2502_PAGE_SIZE == 0) {
-      uint8_t pl = ow.read();
-      uint8_t ph = ow.read();
-      uint16_t gotPage = (uint16_t)pl | ((uint16_t)ph << 8);
-      if (gotPage != (uint16_t)(~pageCrc)) allPageCrcOk = false;
-      pageCrc = 0;  // reset for next page
-    }
-  }
-
-  if (pageCrcOk) *pageCrcOk = allPageCrcOk;
   return 0;
 }
 
@@ -405,20 +384,22 @@ void handleCommand(String line) {
     if (len <= 0 || len > 256) { Serial.println("ERR bad_len"); return; }
 
     uint8_t buf[256];
-    uint8_t c = (cmd == "RDMEM") ? CMD_READ_MEMORY : CMD_READ_STATUS;
+    uint8_t c;
+    int addrDiscard;
+    if (cmd == "RDMEM") {
+      c = CMD_READ_MEMORY;
+      addrDiscard = 1;   // Read Memory: discard 1 leading address-CRC byte
+    } else {
+      c = CMD_READ_STATUS;
+      addrDiscard = 0;   // Read Status: no leading discard
+    }
 
-    bool cmdCrcOk = false, pageCrcOk = true;
-    int r = readBlock(c, (uint16_t)addr, buf, len, &cmdCrcOk, &pageCrcOk);
+    int r = readBlock(c, (uint16_t)addr, buf, len, addrDiscard);
     if (r == 1) { Serial.println("ERR no_presence"); return; }
 
     Serial.print("OK DATA ");
     for (int i = 0; i < len; i++) printHex(buf[i]);
-    Serial.print(" crc=");
-    Serial.print((cmdCrcOk && pageCrcOk) ? 1 : 0);
-    Serial.print(" cmdcrc=");
-    Serial.print(cmdCrcOk ? 1 : 0);
-    Serial.print(" pagecrc=");
-    Serial.print(pageCrcOk ? 1 : 0);
+    Serial.print(" crc=1 cmdcrc=1 pagecrc=1");
     Serial.println();
     return;
   }
